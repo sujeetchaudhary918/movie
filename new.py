@@ -2,295 +2,305 @@ import streamlit as st
 import requests
 import urllib.parse
 import json
-from thefuzz import process, fuzz
 
-# ✅ SET PAGE CONFIG AS THE FIRST STREAMLIT COMMAND
-st.set_page_config(page_title="🎬 Movie Recommender", layout="wide")
+# ✅ SET PAGE CONFIG
+st.set_page_config(page_title="🎬 Media Recommender", layout="wide")
 
-# --- AUTH0 CONFIGURATION (from secrets.toml) ---
+# --- CONFIGURATION ---
 try:
     AUTH0_DOMAIN = st.secrets.auth0.domain
     CLIENT_ID = st.secrets.auth0.client_id
     CLIENT_SECRET = st.secrets.auth0.client_secret
     REDIRECT_URI = "http://localhost:8501"
     AUDIENCE = st.secrets.auth0.audience
+    API_KEY = "3491d28df093be5b5ae5400fb1ac468b"
 except (AttributeError, KeyError):
-    st.error("Auth0 secrets are not configured. Please add them to your .streamlit/secrets.toml file.")
+    st.error("Auth0 or TMDb secrets are not configured correctly in .streamlit/secrets.toml")
     st.stop()
 
-# --- TMDB API CONFIGURATION ---
-API_KEY = "3491d28df093be5b5ae5400fb1ac468b"
 BASE_URL = "https://api.themoviedb.org/3"
 IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
 
-
 # --- INITIALIZE SESSION STATE ---
 if 'view_mode' not in st.session_state: st.session_state.view_mode = 'grid'
-if 'selected_movie_id' not in st.session_state: st.session_state.selected_movie_id = None
+if 'selected_media_id' not in st.session_state: st.session_state.selected_media_id = None
+if 'selected_media_type' not in st.session_state: st.session_state.selected_media_type = None
 if 'current_pages' not in st.session_state: st.session_state.current_pages = {}
 if 'family_mode' not in st.session_state: st.session_state.family_mode = True
 if 'user_info' not in st.session_state: st.session_state.user_info = None
+if 'search_results' not in st.session_state: st.session_state.search_results = []
 if 'search_query' not in st.session_state: st.session_state.search_query = ""
 
-# --- NAVIGATION HELPER FUNCTION ---
+# --- NAVIGATION & AUTHENTICATION HELPERS ---
 def go_home():
     st.session_state.view_mode = 'grid'
-    st.session_state.selected_movie_id = None
+    st.session_state.selected_media_id = None
+    st.session_state.search_results = []
     st.session_state.search_query = ""
     st.session_state.current_pages = {}
 
-# --- AUTHENTICATION & USER PREFERENCES HELPER FUNCTIONS ---
 def get_auth_url():
     params = {"response_type": "code", "client_id": CLIENT_ID, "redirect_uri": REDIRECT_URI, "scope": "openid profile email", "audience": AUDIENCE}
     return f"https://{AUTH0_DOMAIN}/authorize?{urllib.parse.urlencode(params)}"
+
 def exchange_code_for_token(code):
-    token_payload = {"grant_type": "authorization_code", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "code": code, "redirect_uri": REDIRECT_URI}
-    token_response = requests.post(f"https://{AUTH0_DOMAIN}/oauth/token", json=token_payload)
-    if token_response.status_code == 200:
-        token_data = token_response.json()
-        headers = {"Authorization": f"Bearer {token_data['access_token']}"}
-        user_info_response = requests.get(f"https://{AUTH0_DOMAIN}/userinfo", headers=headers)
-        if user_info_response.status_code == 200: return user_info_response.json()
+    payload = {"grant_type": "authorization_code", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET, "code": code, "redirect_uri": REDIRECT_URI}
+    response = requests.post(f"https://{AUTH0_DOMAIN}/oauth/token", json=payload)
+    if response.status_code == 200:
+        headers = {"Authorization": f"Bearer {response.json()['access_token']}"}
+        user_info = requests.get(f"https://{AUTH0_DOMAIN}/userinfo", headers=headers)
+        if user_info.status_code == 200: return user_info.json()
     return None
+
 def get_logout_url():
     params = {"client_id": CLIENT_ID, "returnTo": REDIRECT_URI}
     return f"https://{AUTH0_DOMAIN}/v2/logout?{urllib.parse.urlencode(params)}"
+
 def load_user_preferences():
     try:
         with open('user_preferences.json', 'r') as f: return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError): return {}
+
 def save_user_preferences(prefs):
     with open('user_preferences.json', 'w') as f: json.dump(prefs, f, indent=4)
 
-# --- TMDb API HELPER FUNCTIONS ---
+# --- TMDb API HELPERS ---
 @st.cache_data
-def get_genres(*args, **kwargs):
-    url = f"{BASE_URL}/genre/movie/list?api_key={API_KEY}"
+def get_genres(media_type):
+    url = f"{BASE_URL}/genre/{media_type}/list?api_key={API_KEY}"
     response = requests.get(url)
     return {genre['name']: genre['id'] for genre in response.json()['genres']} if response.status_code == 200 else {}
+
 @st.cache_data
-def get_movies_by_category(category, page=1, region_filters=None, family_mode=False):
-    params = {'api_key': API_KEY, 'page': page, 'include_adult': not family_mode}
-    if region_filters:
-        url = f"{BASE_URL}/discover/movie"
-        params.update(region_filters)
-        if family_mode:
-            params['certification_country'] = 'US'
-            params['certification.lte'] = 'PG-13'
-            params['without_genres'] = '27,53'
-    else:
-        url = f"{BASE_URL}/movie/{category}"
+def get_media_by_category(media_type, category, page=1):
+    params = {'api_key': API_KEY, 'page': page, 'include_adult': not st.session_state.family_mode}
+    url = f"{BASE_URL}/{media_type}/{category}"
     response = requests.get(url, params=params)
     if response.status_code == 200:
         data = response.json()
         return data.get('results', []), data.get('total_pages', 1)
     return [], 1
+
 @st.cache_data
-def get_movies_by_genres(genre_ids, page=1, family_mode=False):
-    if not genre_ids: return [], 1
-    url = f"{BASE_URL}/discover/movie"
-    params = {'api_key': API_KEY, 'with_genres': ",".join(map(str, genre_ids)), 'page': page, 'include_adult': not family_mode}
-    if family_mode:
+def discover_media_by_filter(media_type, page=1, **kwargs):
+    params = {'api_key': API_KEY, 'page': page, 'include_adult': not st.session_state.family_mode, 'sort_by': 'popularity.desc'}
+    params.update(kwargs)
+    if st.session_state.family_mode and 'with_origin_country' not in kwargs:
         params['certification_country'] = 'US'
-        params['certification.lte'] = 'PG-13'
-        params['without_genres'] = '27,53'
+        params['certification.lte'] = 'PG-13' if media_type == 'movie' else 'TV-14'
+    url = f"{BASE_URL}/discover/{media_type}"
     response = requests.get(url, params=params)
     if response.status_code == 200:
         data = response.json()
         return data.get('results', []), data.get('total_pages', 1)
     return [], 1
+
 @st.cache_data
-def search_movie(query, family_mode=False):
-    url = f"{BASE_URL}/search/movie?api_key={API_KEY}&query={urllib.parse.quote(query)}&include_adult={not family_mode}"
+def get_media_by_genres(media_type, genre_ids, page=1):
+    if not genre_ids: return [], 1
+    url = f"{BASE_URL}/discover/{media_type}"
+    params = {'api_key': API_KEY, 'with_genres': ",".join(map(str, genre_ids)), 'page': page, 'include_adult': not st.session_state.family_mode}
+    if st.session_state.family_mode:
+        params['certification_country'] = 'US'
+        params['certification.lte'] = 'PG-13' if media_type == 'movie' else 'TV-14'
+    response = requests.get(url, params=params)
+    if response.status_code == 200:
+        data = response.json()
+        return data.get('results', []), data.get('total_pages', 1)
+    return [], 1
+
+@st.cache_data
+def multi_search(query, family_mode=False):
+    url = f"{BASE_URL}/search/multi?api_key={API_KEY}&query={urllib.parse.quote(query)}&include_adult={not family_mode}"
     response = requests.get(url)
-    return response.json() if response.status_code == 200 else {}
+    return response.json().get('results', []) if response.status_code == 200 else []
+
 @st.cache_data
-def get_similar_movies(movie_id, family_mode=False):
-    url = f"{BASE_URL}/movie/{movie_id}/similar?api_key={API_KEY}&include_adult={not family_mode}"
+def get_media_details(media_type, media_id):
+    url = f"{BASE_URL}/{media_type}/{media_id}?api_key={API_KEY}&append_to_response=videos"
     return requests.get(url).json()
-@st.cache_data
-def get_movie_details(movie_id):
-    url = f"{BASE_URL}/movie/{movie_id}?api_key={API_KEY}&append_to_response=release_dates,videos"
-    return requests.get(url).json()
-@st.cache_data
-def load_movie_titles(family_mode=False):
-    try:
-        with open('movie_titles.json', 'r', encoding='utf-8') as f:
-            titles_map = json.load(f)
-        if family_mode:
-            EXPLICIT_KEYWORDS = ["fifty shades", "sex", "porn", "adult"]
-            clean_titles = {title: movie_id for title, movie_id in titles_map.items() if not any(keyword in title.lower() for keyword in EXPLICIT_KEYWORDS)}
-            return clean_titles
-        return titles_map
-    except FileNotFoundError:
-        return None
-def find_closest_match(query, titles_map):
-    if not query: return None, None
-    best_match = process.extractOne(query.lower(), titles_map.keys(), scorer=fuzz.WRatio, score_cutoff=85)
-    if best_match:
-        title = best_match[0]
-        return title, titles_map[title]
-    return None, None
 
 # --- UI DISPLAY FUNCTIONS ---
-def display_movies_grid(movies, key_prefix):
-    display_count = (len(movies) // 5) * 5
-    movies_to_display = movies[:display_count]
-    if not movies_to_display:
-        st.info("No movies to display in this category.")
-        return
+def display_media_grid(media_list, key_prefix):
+    if not media_list: return
     cols = st.columns(5)
-    for i, movie in enumerate(movies_to_display):
+    for i, media in enumerate(media_list):
         with cols[i % 5]:
-            if movie.get("poster_path"):
-                st.image(f"{IMAGE_BASE}{movie['poster_path']}", use_container_width=True)
-                st.caption(f"**{movie['title']}**")
-                if st.button("View Details", key=f"{key_prefix}_{movie['id']}"):
+            title = media.get("title") or media.get("name")
+            if media.get("poster_path"):
+                st.image(f"{IMAGE_BASE}{media['poster_path']}", use_container_width=True)
+                st.caption(f"**{title}**")
+                if st.button("View Details", key=f"{key_prefix}_{media['id']}"):
                     st.session_state.view_mode = 'detail'
-                    st.session_state.selected_movie_id = movie['id']
+                    st.session_state.selected_media_id = media['id']
+                    st.session_state.selected_media_type = media.get('media_type') or st.session_state.media_type
                     st.rerun()
 
-def display_movie_details(movie_id):
-    details = get_movie_details(movie_id)
-    st.subheader(details.get('title', ''))
+def display_media_details(media_type, media_id):
+    details = get_media_details(media_type, media_id)
+    title = details.get('title') or details.get('name')
+    overview = details.get('overview')
+    release_date = details.get('release_date') or details.get('first_air_date')
+    rating = details.get('vote_average', 0)
+    st.subheader(title)
     col1, col2 = st.columns([1, 2])
     with col1:
         if details.get("poster_path"): st.image(f"{IMAGE_BASE}{details['poster_path']}", use_container_width=True)
     with col2:
-        st.write(f"**⭐ Rating:** {details.get('vote_average', 0):.1f}/10")
-        st.write(f"**📅 Release Date:** {details.get('release_date', 'N/A')}")
+        st.write(f"**⭐ Rating:** {rating:.1f}/10")
+        st.write(f"**📅 First Aired:** {release_date}" if media_type == 'tv' else f"**📅 Release Date:** {release_date}")
         genres = [g['name'] for g in details.get('genres', [])]
         st.write(f"**🎭 Genres:** {', '.join(genres)}")
-        st.write(f"**Overview:** {details.get('overview', 'No description available.')}")
-        videos = details.get("videos", {}).get("results", [])
-        trailer = next((v for v in videos if v['type'] == 'Trailer' and v['site'] == 'YouTube'), None)
+        st.write(f"**Overview:** {overview}")
+        trailer = next((v for v in details.get("videos", {}, {}).get("results", []) if v['type'] == 'Trailer' and v['site'] == 'YouTube'), None)
         if trailer: st.video(f"https://www.youtube.com/watch?v={trailer['key']}")
+    if media_type == 'tv' and details.get('seasons'):
+        st.markdown("---")
+        st.subheader("Seasons")
+        for season in details['seasons']:
+            if season.get('season_number', 0) == 0: continue
+            with st.expander(f"Season {season.get('season_number')} ({season.get('episode_count')} episodes)"):
+                scol1, scol2 = st.columns([1, 3])
+                with scol1:
+                    if season.get('poster_path'): st.image(f"{IMAGE_BASE}{season['poster_path']}")
+                with scol2:
+                    st.write(f"**Aired:** {season.get('air_date', 'N/A')}")
+                    st.write(season.get('overview', 'No overview available.'))
 
 def show_detail_view():
-    if st.button("← Back to movie list"):
-        go_home()
-        st.rerun()
-    display_movie_details(st.session_state.selected_movie_id)
+    if st.button("← Back to Browsing"):
+        go_home(); st.rerun()
+    trailer = next((v for v in details.get("videos", {}).get("results", []) if v['type'] == 'Trailer' and v['site'] == 'YouTube'), None)
 
 def display_pagination_controls(category_key, total_pages):
     current_page = st.session_state.current_pages.get(category_key, 1)
     col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
         if st.button("⬅️ Previous", key=f"prev_{category_key}", disabled=(current_page == 1)):
-            st.session_state.current_pages[category_key] -= 1
-            st.rerun()
+            st.session_state.current_pages[category_key] -= 1; st.rerun()
     with col2:
         st.markdown(f"<div style='text-align: center; margin-top: 5px;'>Page {current_page} of {min(total_pages, 500)}</div>", unsafe_allow_html=True)
     with col3:
-        if st.button("Next ➡️", key=f"next_{category_key}", disabled=(current_page >= total_pages or current_page >= 500)):
-            st.session_state.current_pages[category_key] += 1
+        if st.button("Next ➡️", key=f"next_{category_key}", disabled=(current_page >= min(total_pages, 500))):
+            st.session_state.current_pages[category_key] += 1; st.rerun()
+
+def display_search_feature(search_type='title'):
+    if search_type == 'title':
+        with st.form(key='title_search_form'):
+            search_query = st.text_input("Search for a title", value=st.session_state.search_query)
+            submit_button = st.form_submit_button(label='Search')
+        if submit_button and search_query:
+            st.session_state.search_query = search_query
+            results = multi_search(search_query.strip(), family_mode=st.session_state.family_mode)
+            media_results = [res for res in results if res.get('media_type') in ['movie', 'tv']]
+            st.session_state.search_results = media_results
             st.rerun()
-
-# UPDATED: --- REUSABLE SEARCH COMPONENT with corrected indentation ---
-def display_search_feature():
-    st.header("Find Movies Similar to One You Like")
-    query = st.text_input("Search for a movie:", value=st.session_state.search_query, key="search_input")
-    st.session_state.search_query = query
     
-    if query:
-        family_mode = st.session_state.family_mode
-        results_data = search_movie(query.strip(), family_mode=family_mode)
-        
-        # Check if the search was successful and has results
-        if results_data and "results" in results_data and len(results_data["results"]) > 0:
-            options = {f"{m['title']} ({m.get('release_date','N/A')[:4]})": m["id"] for m in results_data["results"]}
-            choice = st.selectbox("Select a movie from the search results:", list(options.keys()), key="search_choice")
-            movie_id = options[choice]
-            
-            st.markdown("---")
-            display_movie_details(movie_id)
-            st.markdown("---")
-            
-            st.subheader("🍿 Recommended Movies")
-            similar_movies = get_similar_movies(movie_id, family_mode=family_mode).get("results", [])
-            if similar_movies:
-                display_movies_grid(similar_movies, key_prefix="similar")
-            else:
-                st.warning("No similar movies found.")
-        
-        # This 'else' block runs if the search returned no results
-        else:
-            movie_titles = load_movie_titles(family_mode=family_mode)
-            if movie_titles:
-                corrected_title, movie_id = find_closest_match(query, movie_titles)
-                if corrected_title:
-                    st.info(f"Did you mean **{corrected_title}**?")
-                    if st.button(f"Search for '{corrected_title}'"):
-                        st.session_state.search_query = corrected_title
-                        st.rerun()
+    # Keyword search logic can be added here if needed in the future
 
-# --- HEADER AND LOGIN/LOGOUT BUTTONS ---
+# --- HEADER AND MAIN UI COMPONENTS ---
 def display_header():
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1:
-        if st.button("🎬 Movie Recommender", use_container_width=True):
-            go_home()
-            st.rerun()
+        if st.button("🎬 Media Recommender", use_container_width=True):
+            go_home(); st.rerun()
     with col2:
         st.session_state.family_mode = st.toggle("👪 Family Mode", value=st.session_state.family_mode)
     with col3:
-        with st.container():
-            if st.session_state.user_info is None:
-                st.link_button("Login / Sign Up", get_auth_url())
-            else:
-                st.sidebar.button("Logout", on_click=lambda: st.markdown(f'<meta http-equiv="refresh" content="0; url={get_logout_url()}">', unsafe_allow_html=True))
+        if st.session_state.user_info is None:
+            st.link_button("Login / Sign Up", get_auth_url())
+    st.radio("Select Media Type", ['movie', 'tv'], key='media_type', format_func=lambda x: "Movies" if x == 'movie' else "TV Shows", horizontal=True)
 
-# --- LOGGED-OUT HOMEPAGE ---
+# UPDATED: --- LOGGED-OUT HOMEPAGE with corrected category structure ---
 def logged_out_homepage():
     st.write("Browse popular categories or log in for a personalized experience.")
-    display_search_feature()
-    st.markdown("---")
-    categories = {"🔥 Popular": ("popular", {}), "🆕 Now Playing": ("now_playing", {}), "⭐ Top Rated": ("top_rated", {}), "🇮🇳 Bollywood": ("discover", {'with_origin_country': 'IN', 'with_original_language': 'hi'}), "🇺🇸 Hollywood": ("discover", {'with_origin_country': 'US'})}
-    tabs = st.tabs(list(categories.keys()))
-    for i, tab in enumerate(tabs):
-        with tab:
-            category_key = list(categories.keys())[i]
-            category_type, filters = categories[category_key]
-            if category_key not in st.session_state.current_pages:
-                st.session_state.current_pages[category_key] = 1
-            page = st.session_state.current_pages[category_key]
-            movies, total_pages = get_movies_by_category(category_type, page=page, region_filters=filters, family_mode=st.session_state.family_mode)
-            if movies:
-                display_movies_grid(movies, key_prefix=category_key.replace(" ", "_"))
-                st.markdown("---")
-                display_pagination_controls(category_key, total_pages)
-            else:
-                st.info("No movies to display in this category right now.")
+    
+    # Display search results if they exist, otherwise show browse view
+    if st.session_state.search_results or st.session_state.search_query:
+        st.subheader("Search Results")
+        if st.session_state.search_results:
+            display_media_grid(st.session_state.search_results, key_prefix="search")
+        else:
+            st.warning(f"No results found for '{st.session_state.search_query}'.")
+    else:
+        display_search_feature('title')
+        st.markdown("---")
+        media_type = st.session_state.media_type
+        # This dictionary structure is now consistent
+        categories = {
+            'movie': {
+                "🔥 Popular Movies": ("popular", {}),
+                "⭐ Top Rated Movies": ("top_rated", {}),
+                "🇮🇳 Bollywood": ("discover", {'with_origin_country': 'IN', 'with_original_language': 'hi'}),
+            },
+            'tv': {
+                "🔥 Popular TV": ("popular", {}),
+                "⭐ Top Rated TV": ("top_rated", {}),
+                "🇮🇳 Indian TV": ("discover", {'with_origin_country': 'IN'})
+            }
+        }
+        active_categories = categories.get(media_type, {})
+        tab_names = list(active_categories.keys())
+        if tab_names:
+            tabs = st.tabs(tab_names)
+            for i, tab in enumerate(tabs):
+                with tab:
+                    category_key = tab_names[i]
+                    category_type, filters = active_categories[category_key]
+                    page = st.session_state.current_pages.get(category_key, 1)
+                    if category_type == "discover":
+                        media, total_pages = discover_media_by_filter(media_type, page=page, **filters)
+                    else:
+                        media, total_pages = get_media_by_category(media_type, category_type, page=page)
+                    if media:
+                        display_media_grid(media, key_prefix=category_key.replace(" ", "_"))
+                        st.markdown("---")
+                        display_pagination_controls(category_key, total_pages)
+                    else:
+                        st.info("No results found for this category.")
 
-# --- LOGGED-IN MAIN APP ---
+# --- MAIN APP (for logged-in users) ---
 def main_app():
     user = st.session_state.user_info
     username = user.get('nickname', user.get('email'))
     st.sidebar.header(f"Welcome, {user.get('name', '')}!")
     st.sidebar.image(user.get('picture'), width=100)
-    st.sidebar.header("Your Favorite Genres")
-    all_genres = get_genres()
+    st.sidebar.link_button("Logout", get_logout_url())
+    media_type = st.session_state.media_type
+    st.sidebar.header(f"Your Favorite {media_type.replace('_', ' ').capitalize()} Genres")
+    all_genres = get_genres(media_type)
     all_preferences = load_user_preferences()
-    user_saved_genres = all_preferences.get(username, [])
-    selected_genres = st.sidebar.multiselect("Select your genres:", options=list(all_genres.keys()), default=user_saved_genres)
+    user_prefs = all_preferences.get(username, {})
+    user_saved_genres = user_prefs.get(f"{media_type}_genres", [])
+    selected_genres = st.sidebar.multiselect("Select genres:", options=list(all_genres.keys()), default=user_saved_genres)
     if selected_genres != user_saved_genres:
-        all_preferences[username] = selected_genres
+        if "genres" not in user_prefs: user_prefs["genres"] = {}
+        user_prefs[f"{media_type}_genres"] = selected_genres
+        all_preferences[username] = user_prefs
         save_user_preferences(all_preferences)
-        st.session_state.current_pages['genre_prefs'] = 1
         st.sidebar.success("Preferences saved!")
         st.rerun()
-    display_search_feature()
-    st.markdown("---")
-    if selected_genres:
-        st.header("Movies Based on Your Favorite Genres")
-        category_key = "genre_prefs"
-        page = st.session_state.current_pages.get(category_key, 1)
-        genre_ids = [all_genres[name] for name in selected_genres]
-        movies, total_pages = get_movies_by_genres(genre_ids, page=page, family_mode=st.session_state.family_mode)
-        if movies:
-            display_movies_grid(movies, key_prefix="genre")
-            st.markdown("---")
-            display_pagination_controls(category_key, total_pages)
+
+    # Main Page Content
+    if st.session_state.search_results or st.session_state.search_query:
+        st.subheader("Search Results")
+        if st.session_state.search_results:
+            display_media_grid(st.session_state.search_results, key_prefix="search")
+        else:
+            st.warning(f"No results found for '{st.session_state.search_query}'.")
+    else:
+        display_search_feature('title')
+        st.markdown("---")
+        if selected_genres:
+            st.header(f"{media_type.capitalize()}s Based on Your Genres")
+            category_key = f"{media_type}_genre_prefs"
+            page = st.session_state.current_pages.get(category_key, 1)
+            genre_ids = [all_genres[name] for name in selected_genres if name in all_genres]
+            media, total_pages = get_media_by_genres(media_type, genre_ids, page=page)
+            if media:
+                display_media_grid(media, key_prefix="genre_results")
+                st.markdown("---")
+                display_pagination_controls(category_key, total_pages)
 
 # --- LOGIN/LOGOUT AND APP ROUTING ---
 query_params = st.query_params
@@ -302,11 +312,13 @@ if "code" in query_params and st.session_state.user_info is None:
         st.rerun()
 
 # --- MAIN ROUTER ---
-display_header()
-if st.session_state.view_mode == 'detail':
-    show_detail_view()
-else:
-    if st.session_state.user_info is None:
-        logged_out_homepage()
+col_left, col_main, col_right = st.columns([1, 6, 1])
+with col_main:
+    display_header()
+    if st.session_state.view_mode == 'detail':
+        show_detail_view()
     else:
-        main_app()
+        if st.session_state.user_info is None:
+            logged_out_homepage()
+        else:
+            main_app()

@@ -1,9 +1,16 @@
 {
-    "2k23.csdsc2311026": [
-        "Documentary"
-    ],
-    "omegalss002": [],
-    "omegalss004": [
-        "Documentary"
-    ]
+    "2k23.csdsc2311026": {
+        "tv": [
+            "Documentary"
+        ],
+        "genres": {
+            "movie": []
+        },
+        "tags": []
+    },
+    "maxitishere": {
+        "tv": [
+            "Documentary"
+        ]
+    }
 }
